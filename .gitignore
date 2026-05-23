@@ -1,0 +1,9 @@
+build/
+*.o
+*.so.0
+*.so.0.*
+llama.cpp/build*/
+__pycache__/
+*.pyc
+.DS_Store
+ipex-binary/
