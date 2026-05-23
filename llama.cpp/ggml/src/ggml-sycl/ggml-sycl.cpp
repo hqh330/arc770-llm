@@ -64,6 +64,7 @@
 #include "ggml-sycl/diag.hpp"
 #include "ggml-sycl/solve_tri.hpp"
 #include "ggml-sycl/gated_delta_net.hpp"
+#include "ggml-sycl-ipex.h"
 
 static bool g_sycl_loaded = false;
 int g_ggml_sycl_debug = 0;
@@ -229,6 +230,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_disable_graph = get_sycl_env("GGML_SYCL_DISABLE_GRAPH", 1);
         g_ggml_sycl_disable_dnn = get_sycl_env("GGML_SYCL_DISABLE_DNN", 0);
         g_ggml_sycl_prioritize_dmmv = get_sycl_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
+        ipex_fusion::get_fusion_ctx().init();
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO
         g_ggml_sycl_enable_level_zero = get_sycl_env("GGML_SYCL_ENABLE_LEVEL_ZERO", 1);
 #else
@@ -2310,6 +2312,17 @@ inline void ggml_sycl_op_mul_mat_sycl(
         return;
     }
 #endif
+
+    // IPEX-LLM Layer 1: try GPU-side dequant+GEMM via dlopen (batch_forward_q4_K)
+    if (ipex_fusion::try_fused_mul_mat(
+            src0, src1, src1_ddf_i, dst_dd_i,
+            row_diff, src1_ncols, ne10, *stream))
+    {
+        GGML_UNUSED(dst);
+        GGML_UNUSED(src1_ddq_i);
+        GGML_UNUSED(src1_padded_row_size);
+        return;
+    }
 
     if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
         row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {

@@ -26,7 +26,9 @@ bool DlopenBackend::load(const char *ipex_so_path) {
     if (!ipex_so_path)
         ipex_so_path = "../ipex-binary/libggml-sycl.so";
 
-    lib_handle = dlopen(ipex_so_path, RTLD_LAZY | RTLD_LOCAL);
+    // RTLD_DEEPBIND prevents symbol conflicts between our libggml-sycl.so
+    // and IPEX-LLM's libggml-sycl.so (both export ggml_backend_sycl_* symbols)
+    lib_handle = dlopen(ipex_so_path, RTLD_LAZY | RTLD_LOCAL | RTLD_DEEPBIND);
     if (!lib_handle) {
         fprintf(stderr, "[IPEX-dlopen] Cannot load %s: %s\n", ipex_so_path, dlerror());
         return false;
@@ -85,11 +87,17 @@ const uint8_t *DlopenBackend::get_converted_weights(
     const void *key = tensor->data;
     size_t src_size = ggml_nbytes(tensor);
 
+    if (src_size == 0) {
+        fprintf(stderr, "[IPEX-dlopen] Zero-size tensor\n");
+        return nullptr;
+    }
+
     {
         std::lock_guard<std::mutex> lock(cache_mutex);
         auto &cached = weight_cache[key];
         if (!cached.empty()) {
             out_size = cached.size();
+            fprintf(stderr, "[IPEX-dlopen] Using cached weights (%zu bytes)\n", out_size);
             return cached.data();
         }
         // Allocate 2x for IPEX format expansion, convert, cache
@@ -99,6 +107,8 @@ const uint8_t *DlopenBackend::get_converted_weights(
             fprintf(stderr, "[IPEX-dlopen] No converter for type %d\n", tensor->type);
             return nullptr;
         }
+        fprintf(stderr, "[IPEX-dlopen] Converting weights: %zu bytes (type=%d)...\n",
+                src_size, tensor->type);
         conv(tensor->data, cached.data(), src_size);
         out_size = cached.size();
         fprintf(stderr, "[IPEX-dlopen] Converted weights: %zu → %zu bytes (type=%d)\n",
@@ -149,21 +159,26 @@ bool try_fused_mul_mat(
         auto batch_fn  = ctx.dlopen.batch_for(t);
 
         if (converter && batch_fn) {
-            // 1. Get IPEX-format weights (converted + cached)
-            size_t ipex_wsize = 0;
-            const uint8_t *ipex_weights = ctx.dlopen.get_converted_weights(
-                src0, ipex_wsize);
-            if (!ipex_weights) return false;
+            // 1. Copy weights from device to host for format conversion
+            size_t src_size = ggml_nbytes(src0);
+            if (src_size == 0) return false;
 
-            // 2. Upload converted weights to device
-            //    (caller must ensure src1_fp32 and dst_fp32 are already on device)
-            auto *d_weights = sycl::malloc_device<uint8_t>(ipex_wsize, q);
-            if (!d_weights) return false;
-            q.memcpy(d_weights, ipex_weights, ipex_wsize);
+            std::vector<uint8_t> host_weights(src_size);
+            q.memcpy(host_weights.data(), src0->data, src_size);
             q.wait();
 
-            // 3. Launch IPEX-LLM batch forward
-            //    batch_forward_q4_K(input_fp32, weights_ipex, output_fp32, M, N, K, queue)
+            // 2. Convert to IPEX format (cached per tensor pointer)
+            size_t ipex_wsize = src_size * 2;
+            std::vector<uint8_t> ipex_weights(ipex_wsize);
+            converter(host_weights.data(), ipex_weights.data(), src_size);
+
+            // 3. Upload converted weights to device
+            auto *d_weights = sycl::malloc_device<uint8_t>(ipex_wsize, q);
+            if (!d_weights) return false;
+            q.memcpy(d_weights, ipex_weights.data(), ipex_wsize);
+            q.wait();
+
+            // 4. Launch IPEX-LLM batch forward
             batch_fn(src1_fp32, d_weights, dst_fp32, M, N, K, q);
             q.wait();
 
