@@ -2313,14 +2313,17 @@ inline void ggml_sycl_op_mul_mat_sycl(
     }
 #endif
 
-    // IPEX-LLM Layer 1: try GPU-side dequant+GEMM via dlopen (batch_forward_q4_K)
+    // IPEX-LLM fusion: try GPU-side dequant+GEMM via dlopen / SPIR-V
     if (ipex_fusion::try_fused_mul_mat(
-            src0, src1, src1_ddf_i, dst_dd_i,
-            row_diff, src1_ncols, ne10, *stream))
+            src0, src1, dst,
+            src1_ddf_i, dst_dd_i,
+            row_diff, src1_ncols, ne10, *stream,
+            &ctx,
+            src0_dd_i, (const char *)dst_dd_i,
+            row_low, row_high,
+            src1_padded_row_size))
     {
-        GGML_UNUSED(dst);
         GGML_UNUSED(src1_ddq_i);
-        GGML_UNUSED(src1_padded_row_size);
         return;
     }
 

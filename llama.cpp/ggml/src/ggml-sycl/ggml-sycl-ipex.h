@@ -21,6 +21,8 @@
 #include <memory>
 #include <mutex>
 
+struct ggml_backend_sycl_context;  // forward decl from common.hpp
+
 namespace ipex_fusion {
 
 // ============================================================
@@ -43,9 +45,7 @@ enum class FusionLevel {
 struct DlopenBackend {
     void *lib_handle = nullptr;
 
-    // Fused dequant+GEMM: processes one input vector against weight matrix
-    // void f(const uchar *weights_q4k, const float *input_row,
-    //        float *output_row, int K, int N, sycl::queue &q);
+    // Per-token fused dequant+GEMM
     using VecMatFn = void (*)(const unsigned char *, const float *,
                               float *, int, int, sycl::queue &);
     VecMatFn vec_q4_0 = nullptr;
@@ -53,6 +53,14 @@ struct DlopenBackend {
     VecMatFn vec_q5_K = nullptr;
     VecMatFn vec_q6_K = nullptr;
     VecMatFn vec_q8_0 = nullptr;
+
+    // Batched quantized GEMM (internal Q8_1 quant + SPIR-V kernel)
+    using MulMatQFn = void (*)(ggml_backend_sycl_context &,
+                               const ggml_tensor *, const ggml_tensor *,
+                               ggml_tensor *, const char *, const float *,
+                               const char *, float *, long, long, long, long,
+                               sycl::queue *const &);
+    MulMatQFn mul_mat_q = nullptr;
 
     bool load(const char *ipex_so_path);
     bool available() const { return lib_handle != nullptr && vec_q4_K != nullptr; }
@@ -138,9 +146,15 @@ FusionContext &get_fusion_ctx();
 // Returns true if handled, false if caller should fall through to oneMKL path.
 bool try_fused_mul_mat(
     const ggml_tensor *src0, const ggml_tensor *src1,
+    ggml_tensor *dst,
     const float *src1_fp32, float *dst_fp32,
     int64_t M, int64_t N, int64_t K,
     sycl::queue &q,
+    ggml_backend_sycl_context *backend_ctx = nullptr,
+    const char *src0_dd = nullptr,
+    const char *dst_dd = nullptr,
+    long row_low = 0, long row_high = 0,
+    long padded_row_size = 0,
     FusionLevel min_level = FusionLevel::DLOPEN);
 
 } // namespace ipex_fusion

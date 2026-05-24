@@ -6,6 +6,7 @@
 // (relative to llama.cpp build dir, or set IPEX_SO_PATH env var)
 
 #include "ggml-sycl-ipex.h"
+#include "common.hpp"
 #include <dlfcn.h>
 #include <cstdlib>
 #include <cstring>
@@ -32,7 +33,7 @@ bool DlopenBackend::load(const char *ipex_so_path) {
         return false;
     }
 
-    // Resolve fused dequant+GEMM vec kernels (work on raw Q4_K weights, no conversion)
+    // Per-token dequant+GEMM vec kernels (fallback)
     vec_q4_0 = (VecMatFn)dlsym(lib_handle,
         "_Z41ggml_sycl_op_dequantize_mul_mat_vec_q4_0PKhPKfPfiiRN4sycl3_V15queueE");
     vec_q4_K = (VecMatFn)dlsym(lib_handle,
@@ -44,8 +45,13 @@ bool DlopenBackend::load(const char *ipex_so_path) {
     vec_q8_0 = (VecMatFn)dlsym(lib_handle,
         "_Z41ggml_sycl_op_dequantize_mul_mat_vec_q8_0PKhPKfPfiiRN4sycl3_V15queueE");
 
-    fprintf(stderr, "[IPEX-dlopen] Loaded vec kernels: q4_0=%p q4_K=%p q5_K=%p q6_K=%p q8_0=%p\n",
-            (void*)vec_q4_0, (void*)vec_q4_K, (void*)vec_q5_K, (void*)vec_q6_K, (void*)vec_q8_0);
+    // Batched quantized GEMM (quantizes activations to Q8_1 internally,
+    // then launches SPIR-V kernel for full dequant+GEMM)
+    mul_mat_q = (MulMatQFn)dlsym(lib_handle,
+        "_Z22ggml_sycl_op_mul_mat_qR25ggml_backend_sycl_contextPK11ggml_tensorS3_PS1_PKcPKfS6_PfllllRKPN4sycl3_V15queueE");
+
+    fprintf(stderr, "[IPEX-dlopen] Loaded vec kernels: q4_K=%p q5_K=%p mul_mat_q=%p\n",
+            (void*)vec_q4_K, (void*)vec_q5_K, (void*)mul_mat_q);
 
     return vec_q4_K != nullptr;
 }
@@ -82,15 +88,21 @@ FusionContext &get_fusion_ctx() {
 
 bool try_fused_mul_mat(
     const ggml_tensor *src0, const ggml_tensor *src1,
+    ggml_tensor *dst,
     const float *src1_fp32, float *dst_fp32,
     int64_t M, int64_t N, int64_t K,
     sycl::queue &q,
+    ggml_backend_sycl_context *backend_ctx,
+    const char *src0_dd,
+    const char *dst_dd,
+    long row_low, long row_high,
+    long padded_row_size,
     FusionLevel min_level)
 {
     auto &ctx = get_fusion_ctx();
     if (!ctx.initialized) ctx.init();
 
-    // Lazy-load SPIR-V kernels on first call (even if dlopen will handle this op)
+    // Lazy-load SPIR-V kernels on first call
     if (!ctx.spirv_attempted) {
         ctx.spirv_attempted = true;
         if (q.get_device().get_backend() == sycl::backend::ext_oneapi_level_zero) {
@@ -101,21 +113,18 @@ bool try_fused_mul_mat(
 
     ggml_type t = src0->type;
 
-    // --- Layer 1: dlopen vec-mat path ---
-    if (min_level <= FusionLevel::DLOPEN && ctx.dlopen.available()) {
+    // --- Layer 1: dlopen per-token vec-mat (opt-in via IPEX_FORCE=1) ---
+    // The per-token dlopen overhead currently makes this slower than MKL
+    // for both prompt and generation. Enable only for testing.
+    static int ipex_force = []() {
+        const char *v = std::getenv("IPEX_FORCE");
+        return v ? std::atoi(v) : 0;
+    }();
+
+    if (min_level <= FusionLevel::DLOPEN && ctx.dlopen.available() && ipex_force) {
         auto vec_fn = ctx.dlopen.vec_mat_for(t);
 
         if (vec_fn) {
-            // IPEX fused dequant+GEMM kernel: one call per input row (token)
-            // C[M×N] = A[M×K] × B[K×N]
-            // IPEX fn: output_vec[1×M] = input_vec[1×K] × dequant(weights[K×M])
-            //   weights = src0 (K elts per row, M rows, Q4_K on device)
-            //   input   = one column of B = one token's embedding (K elts)
-            //   output  = one column of C (M elts)
-            //
-            // oneMKL layout: C has ldc=M, so C[:,t] = dst_fp32 + t*M
-            //                B has ldb=K, so B[:,t] = src1_fp32 + t*K
-
             const auto *d_weights = (const unsigned char *)src0->data;
 
             for (int64_t tok = 0; tok < N; tok++) {
@@ -142,8 +151,6 @@ bool try_fused_mul_mat(
             default: break;
         }
         if (kern && kern->sycl_kernel) {
-            // TODO: Quantize activations to Q8_1, then launch the SPIR-V kernel
-            //       via q.parallel_for(kernel_bundle, kernel, ...)
             fprintf(stderr, "[IPEX-spirv] Found kernel '%s' for type %d"
                     " (args=%d) — dispatch pending\n",
                     kern->name.c_str(), (int)t, kern->num_args);

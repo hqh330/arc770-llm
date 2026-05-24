@@ -115,6 +115,10 @@ bool SpirvBackend::load_spirv_file(const char *path, sycl::queue &q) {
 
     fprintf(stderr, "[IPEX-spirv] Loaded %zu kernels from %s\n",
             mod.kernels.size(), path);
+    for (auto &k : mod.kernels) {
+        fprintf(stderr, "[IPEX-spirv]   %s (args=%d)\n",
+                k.name.c_str(), k.num_args);
+    }
 
     modules.push_back(std::move(mod));
     return true;
