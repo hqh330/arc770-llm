@@ -19,14 +19,14 @@ namespace ipex_fusion {
 // Check if two tensors share the same src1 (same activation input)
 static bool same_src1(const ggml_tensor *a, const ggml_tensor *b) {
     if (!a || !b) return false;
-    if (a->n_src < 2 || b->n_src < 2) return false;
+    if (!a->src[0] || !a->src[1] || !b->src[0] || !b->src[1]) return false;
     return a->src[1] == b->src[1];
 }
 
 // Check if a tensor is a MUL_MAT op with quantized weights
 static bool is_quantized_mul_mat(const ggml_tensor *t) {
     if (!t || t->op != GGML_OP_MUL_MAT) return false;
-    if (t->n_src < 1) return false;
+    if (!t->src[0]) return false;
     return ggml_is_quantized(t->src[0]->type);
 }
 

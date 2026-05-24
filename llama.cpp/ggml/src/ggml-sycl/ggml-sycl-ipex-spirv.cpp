@@ -80,7 +80,8 @@ bool SpirvBackend::load_spirv_file(const char *path, sycl::queue &q) {
 
     Module mod;
     mod.ze_module = ze_mod;
-    mod.bundle    = bundle;
+    mod.bundle    = std::make_unique<
+        sycl::kernel_bundle<sycl::bundle_state::executable>>(bundle);
 
     for (uint32_t i = 0; i < name_count; i++) {
         std::string name(knames[i]);
@@ -98,15 +99,15 @@ bool SpirvBackend::load_spirv_file(const char *path, sycl::queue &q) {
 
         // Wrap as SYCL kernel
         sycl::backend_input_t<sycl::backend::ext_oneapi_level_zero,
-            sycl::kernel> kern_in{mod.bundle, ze_kern,
+            sycl::kernel> kern_in{*mod.bundle, ze_kern,
                 sycl::ext::oneapi::level_zero::ownership::keep};
         auto sk = sycl::make_kernel<sycl::backend::ext_oneapi_level_zero>(
             kern_in, q.get_context());
 
         SpirvKernel k;
-        k.name     = name;
-        k.sycl_kernel = sk;
-        k.num_args = sk.get_info<sycl::info::kernel::num_args>();
+        k.name         = name;
+        k.sycl_kernel  = std::make_unique<sycl::kernel>(sk);
+        k.num_args     = sk.get_info<sycl::info::kernel::num_args>();
 
         mod.kernels.push_back(std::move(k));
         zeKernelDestroy(ze_kern);

@@ -66,20 +66,20 @@ struct DlopenBackend {
 
 struct SpirvKernel {
     std::string name;
-    sycl::kernel  sycl_kernel;
-    int           num_args;
-    // Cached for launch
+    std::unique_ptr<sycl::kernel> sycl_kernel;
+    int           num_args = 0;
 };
 
 struct SpirvBackend {
     struct Module {
         void        *ze_module = nullptr;  // ze_module_handle_t (opaque)
-        sycl::kernel_bundle<sycl::bundle_state::executable> bundle;
+        std::unique_ptr<sycl::kernel_bundle<sycl::bundle_state::executable>> bundle;
         std::vector<SpirvKernel> kernels;
     };
     std::vector<Module> modules;
 
     bool load_spirv_file(const char *path, sycl::queue &q);
+    bool load_recommended(sycl::queue &q);
     bool available() const { return !modules.empty(); }
 
     // Find a kernel by name substring
@@ -125,7 +125,8 @@ MLPPattern detect_mlp_pattern(const ggml_tensor *gate_tensor,
 struct FusionContext {
     DlopenBackend dlopen;
     SpirvBackend  spirv;
-    bool          initialized = false;
+    bool          initialized       = false;
+    bool          spirv_attempted   = false;
 
     void init();
 };

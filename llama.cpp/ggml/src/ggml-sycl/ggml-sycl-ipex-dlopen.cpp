@@ -77,36 +77,6 @@ FusionContext &get_fusion_ctx() {
 }
 
 // ============================================================
-// SpirvBackend stubs (Layer 2 — not yet implemented)
-// ============================================================
-
-bool SpirvBackend::load_spirv_file(const char *path, sycl::queue &q) {
-    (void)path; (void)q;
-    return false;
-}
-
-const SpirvKernel *SpirvBackend::find_kernel(const std::string &name_substr) const {
-    (void)name_substr;
-    return nullptr;
-}
-
-// Graph pattern detection stubs (Layer 3 — not yet implemented)
-
-QKVPattern detect_qkv_pattern(const ggml_tensor *q_tensor,
-                               const ggml_tensor *k_tensor,
-                               const ggml_tensor *v_tensor) {
-    (void)q_tensor; (void)k_tensor; (void)v_tensor;
-    return QKVPattern{};
-}
-
-MLPPattern detect_mlp_pattern(const ggml_tensor *gate_tensor,
-                               const ggml_tensor *up_tensor,
-                               const ggml_tensor *down_tensor) {
-    (void)gate_tensor; (void)up_tensor; (void)down_tensor;
-    return MLPPattern{};
-}
-
-// ============================================================
 // Main dispatch: try_fused_mul_mat
 // ============================================================
 
@@ -119,6 +89,15 @@ bool try_fused_mul_mat(
 {
     auto &ctx = get_fusion_ctx();
     if (!ctx.initialized) ctx.init();
+
+    // Lazy-load SPIR-V kernels on first call (even if dlopen will handle this op)
+    if (!ctx.spirv_attempted) {
+        ctx.spirv_attempted = true;
+        if (q.get_device().get_backend() == sycl::backend::ext_oneapi_level_zero) {
+            fprintf(stderr, "[IPEX-spirv] Loading recommended kernels...\n");
+            ctx.spirv.load_recommended(q);
+        }
+    }
 
     ggml_type t = src0->type;
 
@@ -162,8 +141,12 @@ bool try_fused_mul_mat(
                 break;
             default: break;
         }
-        if (kern) {
-            (void)kern;  // placeholder — implement per-kernel arg binding
+        if (kern && kern->sycl_kernel) {
+            // TODO: Quantize activations to Q8_1, then launch the SPIR-V kernel
+            //       via q.parallel_for(kernel_bundle, kernel, ...)
+            fprintf(stderr, "[IPEX-spirv] Found kernel '%s' for type %d"
+                    " (args=%d) — dispatch pending\n",
+                    kern->name.c_str(), (int)t, kern->num_args);
         }
     }
 
