@@ -1,6 +1,6 @@
 // Layer 1: dlopen IPEX-LLM libggml-sycl.so
-// Calls IPEX-LLM's format converters + batch_forward_q4_K directly.
-// This is the fastest path — zero new GPU code, just host-side glue.
+// Calls IPEX-LLM's dequantize+GEMM fused kernels directly from our SYCL queue.
+// Zero new GPU code — just host-side glue resolving symbols and forwarding calls.
 //
 // IPEX-LLM .so is expected at: ../ipex-binary/libggml-sycl.so
 // (relative to llama.cpp build dir, or set IPEX_SO_PATH env var)
@@ -19,101 +19,45 @@ namespace ipex_fusion {
 // ============================================================
 
 bool DlopenBackend::load(const char *ipex_so_path) {
-    if (lib_handle) return true;  // already loaded
+    if (lib_handle) return true;
 
     if (!ipex_so_path)
         ipex_so_path = std::getenv("IPEX_SO_PATH");
     if (!ipex_so_path)
         ipex_so_path = "../ipex-binary/libggml-sycl.so";
 
-    // RTLD_DEEPBIND prevents symbol conflicts between our libggml-sycl.so
-    // and IPEX-LLM's libggml-sycl.so (both export ggml_backend_sycl_* symbols)
     lib_handle = dlopen(ipex_so_path, RTLD_LAZY | RTLD_LOCAL | RTLD_DEEPBIND);
     if (!lib_handle) {
         fprintf(stderr, "[IPEX-dlopen] Cannot load %s: %s\n", ipex_so_path, dlerror());
         return false;
     }
 
-    // Resolve format converters (C++ mangled names from IPEX-LLM 2.3.0)
-    q4_0_convert = (ConvertFn)dlsym(lib_handle,
-        "_Z31ggml_q4_0_format_convert_to_xpuPKvPvm");
-    q4_K_convert = (ConvertFn)dlsym(lib_handle,
-        "_Z31ggml_q4_K_format_convert_to_xpuPKvPvm");
-    q5_K_convert = (ConvertFn)dlsym(lib_handle,
-        "_Z31ggml_q5_K_format_convert_to_xpuPKvPvm");
-    q6_K_convert = (ConvertFn)dlsym(lib_handle,
-        "_Z31ggml_q6_K_format_convert_to_xpuPKvPvm");
-    q8_0_convert = (ConvertFn)dlsym(lib_handle,
-        "_Z31ggml_q8_0_format_convert_to_xpuPKvPvm");
+    // Resolve fused dequant+GEMM vec kernels (work on raw Q4_K weights, no conversion)
+    vec_q4_0 = (VecMatFn)dlsym(lib_handle,
+        "_Z41ggml_sycl_op_dequantize_mul_mat_vec_q4_0PKhPKfPfiiRN4sycl3_V15queueE");
+    vec_q4_K = (VecMatFn)dlsym(lib_handle,
+        "_Z40ggml_sycl_op_dequantize_mul_mat_vec_q4_KPKhPKfPfiiRN4sycl3_V15queueE");
+    vec_q5_K = (VecMatFn)dlsym(lib_handle,
+        "_Z40ggml_sycl_op_dequantize_mul_mat_vec_q5_KPKhPKfPfiiRN4sycl3_V15queueE");
+    vec_q6_K = (VecMatFn)dlsym(lib_handle,
+        "_Z40ggml_sycl_op_dequantize_mul_mat_vec_q6_kPKhPKfPfiiRN4sycl3_V15queueE");
+    vec_q8_0 = (VecMatFn)dlsym(lib_handle,
+        "_Z41ggml_sycl_op_dequantize_mul_mat_vec_q8_0PKhPKfPfiiRN4sycl3_V15queueE");
 
-    // Resolve batch forward functions
-    batch_q4k = (BatchFn)dlsym(lib_handle,
-        "_Z18batch_forward_q4_KPKfPKhPflllRN4sycl3_V15queueE");
+    fprintf(stderr, "[IPEX-dlopen] Loaded vec kernels: q4_0=%p q4_K=%p q5_K=%p q6_K=%p q8_0=%p\n",
+            (void*)vec_q4_0, (void*)vec_q4_K, (void*)vec_q5_K, (void*)vec_q6_K, (void*)vec_q8_0);
 
-    fprintf(stderr, "[IPEX-dlopen] Loaded: q4_K=%p q5_K=%p q6_K=%p batch_q4k=%p\n",
-            (void*)q4_K_convert, (void*)q5_K_convert,
-            (void*)q6_K_convert, (void*)batch_q4k);
-
-    return batch_q4k != nullptr;
+    return vec_q4_K != nullptr;
 }
 
-DlopenBackend::ConvertFn DlopenBackend::converter_for(ggml_type t) const {
+DlopenBackend::VecMatFn DlopenBackend::vec_mat_for(ggml_type t) const {
     switch (t) {
-        case GGML_TYPE_Q4_0: return q4_0_convert;
-        case GGML_TYPE_Q4_K: return q4_K_convert;
-        case GGML_TYPE_Q5_K: return q5_K_convert;
-        case GGML_TYPE_Q6_K: return q6_K_convert;
-        case GGML_TYPE_Q8_0: return q8_0_convert;
+        case GGML_TYPE_Q4_0: return vec_q4_0;
+        case GGML_TYPE_Q4_K: return vec_q4_K;
+        case GGML_TYPE_Q5_K: return vec_q5_K;
+        case GGML_TYPE_Q6_K: return vec_q6_K;
+        case GGML_TYPE_Q8_0: return vec_q8_0;
         default: return nullptr;
-    }
-}
-
-DlopenBackend::BatchFn DlopenBackend::batch_for(ggml_type t) const {
-    // batch_forward_q4_K handles Q4_K, Q5_K, Q6_K
-    // (IPEX-LLM's internal dispatch routes to correct kernel variant)
-    switch (t) {
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q5_K:
-        case GGML_TYPE_Q6_K:
-            return batch_q4k;
-        default:
-            return nullptr;
-    }
-}
-
-const uint8_t *DlopenBackend::get_converted_weights(
-    const ggml_tensor *tensor, size_t &out_size)
-{
-    const void *key = tensor->data;
-    size_t src_size = ggml_nbytes(tensor);
-
-    if (src_size == 0) {
-        fprintf(stderr, "[IPEX-dlopen] Zero-size tensor\n");
-        return nullptr;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        auto &cached = weight_cache[key];
-        if (!cached.empty()) {
-            out_size = cached.size();
-            fprintf(stderr, "[IPEX-dlopen] Using cached weights (%zu bytes)\n", out_size);
-            return cached.data();
-        }
-        // Allocate 2x for IPEX format expansion, convert, cache
-        cached.resize(src_size * 2);
-        ConvertFn conv = converter_for(tensor->type);
-        if (!conv) {
-            fprintf(stderr, "[IPEX-dlopen] No converter for type %d\n", tensor->type);
-            return nullptr;
-        }
-        fprintf(stderr, "[IPEX-dlopen] Converting weights: %zu bytes (type=%d)...\n",
-                src_size, tensor->type);
-        conv(tensor->data, cached.data(), src_size);
-        out_size = cached.size();
-        fprintf(stderr, "[IPEX-dlopen] Converted weights: %zu → %zu bytes (type=%d)\n",
-                src_size, out_size, tensor->type);
-        return cached.data();
     }
 }
 
@@ -124,17 +68,42 @@ const uint8_t *DlopenBackend::get_converted_weights(
 void FusionContext::init() {
     if (initialized) return;
     initialized = true;
-
-    // Layer 1: try dlopen
-    dlopen.load(nullptr);  // uses IPEX_SO_PATH or default path
-
-    // Layer 2: try SPIR-V loading (deferred — requires active SYCL queue)
-    // spirv.load_spirv_file(...) is called lazily on first use
+    dlopen.load(nullptr);
 }
 
 FusionContext &get_fusion_ctx() {
     static FusionContext ctx;
     return ctx;
+}
+
+// ============================================================
+// SpirvBackend stubs (Layer 2 — not yet implemented)
+// ============================================================
+
+bool SpirvBackend::load_spirv_file(const char *path, sycl::queue &q) {
+    (void)path; (void)q;
+    return false;
+}
+
+const SpirvKernel *SpirvBackend::find_kernel(const std::string &name_substr) const {
+    (void)name_substr;
+    return nullptr;
+}
+
+// Graph pattern detection stubs (Layer 3 — not yet implemented)
+
+QKVPattern detect_qkv_pattern(const ggml_tensor *q_tensor,
+                               const ggml_tensor *k_tensor,
+                               const ggml_tensor *v_tensor) {
+    (void)q_tensor; (void)k_tensor; (void)v_tensor;
+    return QKVPattern{};
+}
+
+MLPPattern detect_mlp_pattern(const ggml_tensor *gate_tensor,
+                               const ggml_tensor *up_tensor,
+                               const ggml_tensor *down_tensor) {
+    (void)gate_tensor; (void)up_tensor; (void)down_tensor;
+    return MLPPattern{};
 }
 
 // ============================================================
@@ -153,69 +122,50 @@ bool try_fused_mul_mat(
 
     ggml_type t = src0->type;
 
-    // --- Layer 1: dlopen path ---
+    // --- Layer 1: dlopen vec-mat path ---
     if (min_level <= FusionLevel::DLOPEN && ctx.dlopen.available()) {
-        auto converter = ctx.dlopen.converter_for(t);
-        auto batch_fn  = ctx.dlopen.batch_for(t);
+        auto vec_fn = ctx.dlopen.vec_mat_for(t);
 
-        if (converter && batch_fn) {
-            // 1. Copy weights from device to host for format conversion
-            size_t src_size = ggml_nbytes(src0);
-            if (src_size == 0) return false;
+        if (vec_fn) {
+            // IPEX fused dequant+GEMM kernel: one call per input row (token)
+            // C[M×N] = A[M×K] × B[K×N]
+            // IPEX fn: output_vec[1×M] = input_vec[1×K] × dequant(weights[K×M])
+            //   weights = src0 (K elts per row, M rows, Q4_K on device)
+            //   input   = one column of B = one token's embedding (K elts)
+            //   output  = one column of C (M elts)
+            //
+            // oneMKL layout: C has ldc=M, so C[:,t] = dst_fp32 + t*M
+            //                B has ldb=K, so B[:,t] = src1_fp32 + t*K
 
-            std::vector<uint8_t> host_weights(src_size);
-            q.memcpy(host_weights.data(), src0->data, src_size);
+            const auto *d_weights = (const unsigned char *)src0->data;
+
+            for (int64_t tok = 0; tok < N; tok++) {
+                vec_fn(d_weights,
+                       src1_fp32 + tok * K,
+                       dst_fp32  + tok * M,
+                       (int)K, (int)M, q);
+            }
             q.wait();
-
-            // 2. Convert to IPEX format (cached per tensor pointer)
-            size_t ipex_wsize = src_size * 2;
-            std::vector<uint8_t> ipex_weights(ipex_wsize);
-            converter(host_weights.data(), ipex_weights.data(), src_size);
-
-            // 3. Upload converted weights to device
-            auto *d_weights = sycl::malloc_device<uint8_t>(ipex_wsize, q);
-            if (!d_weights) return false;
-            q.memcpy(d_weights, ipex_weights.data(), ipex_wsize);
-            q.wait();
-
-            // 4. Launch IPEX-LLM batch forward
-            batch_fn(src1_fp32, d_weights, dst_fp32, M, N, K, q);
-            q.wait();
-
-            sycl::free(d_weights, q);
             return true;
         }
     }
 
     // --- Layer 2: SPIR-V path ---
     if (min_level <= FusionLevel::SPIRV && ctx.spirv.available()) {
-        // Look for a kernel matching this quant type + problem size
         const SpirvKernel *kern = nullptr;
-
         switch (t) {
             case GGML_TYPE_Q4_K:
-                // kernel_24.spv: ggml_mul_mat_q4_K_q8_1_sycl
-                // Requires activations quantized to Q8_1 first
                 kern = ctx.spirv.find_kernel("ggml_mul_mat_q4_K_q8_1_sycl");
                 break;
             case GGML_TYPE_Q4_0:
-                // kernel_0.spv: linear_forward_kernel (FP32 in → FP32 out)
                 kern = ctx.spirv.find_kernel("linear_forward_kernel");
                 break;
-            default:
-                break;
+            default: break;
         }
-
         if (kern) {
-            // Launch via SYCL interop kernel
-            // (Detailed arg binding depends on kernel — see kernel-signatures.md)
-            // TODO: implement per-kernel arg binding
-            (void)kern;  // placeholder
+            (void)kern;  // placeholder — implement per-kernel arg binding
         }
     }
-
-    // --- Layer 3: Native SYCL ESIMD (future) ---
-    // TODO: our own dequant+GEMM fusion kernel
 
     return false;
 }

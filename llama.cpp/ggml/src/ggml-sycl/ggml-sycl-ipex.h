@@ -43,34 +43,21 @@ enum class FusionLevel {
 struct DlopenBackend {
     void *lib_handle = nullptr;
 
-    // Format converters: standard Q4_K → IPEX internal format
-    using ConvertFn = void (*)(const void *src, void *dst, unsigned long size);
-    ConvertFn q4_0_convert = nullptr;
-    ConvertFn q4_K_convert = nullptr;
-    ConvertFn q5_K_convert = nullptr;
-    ConvertFn q6_K_convert = nullptr;
-    ConvertFn q8_0_convert = nullptr;
-
-    // Batch forward: GPU-side dequant+GEMM in one pass
-    using BatchFn = void (*)(const float *input, const unsigned char *weights,
-                             float *output, long M, long N, long K,
-                             sycl::queue &q);
-    BatchFn batch_q4k = nullptr;   // handles Q4_K, Q5_K, Q6_K
-    BatchFn batch_q4_0 = nullptr;  // handles Q4_0, Q4_1 (from linear_forward*)
-
-    // Weight cache: keep converted IPEX-format weights per tensor pointer
-    std::mutex cache_mutex;
-    std::unordered_map<const void *, std::vector<uint8_t>> weight_cache;
+    // Fused dequant+GEMM: processes one input vector against weight matrix
+    // void f(const uchar *weights_q4k, const float *input_row,
+    //        float *output_row, int K, int N, sycl::queue &q);
+    using VecMatFn = void (*)(const unsigned char *, const float *,
+                              float *, int, int, sycl::queue &);
+    VecMatFn vec_q4_0 = nullptr;
+    VecMatFn vec_q4_K = nullptr;
+    VecMatFn vec_q5_K = nullptr;
+    VecMatFn vec_q6_K = nullptr;
+    VecMatFn vec_q8_0 = nullptr;
 
     bool load(const char *ipex_so_path);
-    bool available() const { return lib_handle != nullptr && batch_q4k != nullptr; }
+    bool available() const { return lib_handle != nullptr && vec_q4_K != nullptr; }
 
-    ConvertFn converter_for(ggml_type t) const;
-    BatchFn   batch_for(ggml_type t) const;
-
-    // Get or convert weights to IPEX format (cached)
-    const uint8_t *get_converted_weights(const ggml_tensor *tensor,
-                                         size_t &out_size);
+    VecMatFn vec_mat_for(ggml_type t) const;
 };
 
 // ============================================================
